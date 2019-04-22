@@ -3,6 +3,7 @@ package cassandra
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"fmt"
 	"sync/atomic"
 )
 
@@ -45,25 +46,19 @@ func PreparedMessage(inputMessage *Frame) *Frame {
 
 	statementNumber := make([]byte, 0, 8)
 	binary.BigEndian.PutUint64(statementNumber, atomic.AddUint64(&prepareCount, 1))
-
 	statementID := preparedHasher.Sum(statementNumber)
-	// resultMetadataId := preparedHasher.Sum([]byte("resultMetadataId"))
 
 	// Write id, [short bytes]
 	binary.BigEndian.PutUint16(replyBody, 16)
 	replyBody = append(replyBody, statementID...)
 
 	// Write metadata
-	metadata := prepare(inputMessage.Body) // this should be created first..
-	replyBody = encodePreparedMetadata(replyBody, metadata)
+	prepareMeta := prepare(inputMessage.Body) // this should be created first..
+	replyBody = encodePreparedMetadata(replyBody, prepareMeta)
 
 	// Write resultMetadata, which is the same as rows metadata..
-
-	// Write next:
-	/*
-	   ResultSet.PreparedMetadata.codec.encode(prepared.metadata, dest, version);
-	   ResultSet.ResultMetadata.codec.encode(prepared.resultMetadata, dest, version);
-	*/
+	resultMeta := prepareMetadataToResultMetadata(prepareMeta)
+	replyBody = encodeResultMetadata(replyBody, resultMeta)
 
 	// The result to a PREPARE message. The body of a Prepared result is:
 	// [short] A 2 bytes unsigned integer
@@ -99,12 +94,30 @@ func PreparedMessage(inputMessage *Frame) *Frame {
 
 func prepare(body []byte) *PreparedMetadata {
 	// Parse the body and prepare those?
-	return &PreparedMetadata{}
+	return prepareCassandraStress()
+}
+
+// prepareCassandraStress works for the normal insert workload in the cassandra-stress tool
+func prepareCassandraStress() *PreparedMetadata {
+	columns := make([]ColumnSpecification, 0, 6)
+	for i := 0; i < 6; i++ {
+		columns[i] = ColumnSpecification{
+			Keyspace:   "keyspace1",
+			Table:      "standard1",
+			ColumnName: fmt.Sprintf("C%d", i),
+			Type:       3, // BLOB
+		}
+	}
+	pm := &PreparedMetadata{
+		Columns:                    columns,
+		Flags:                      0x0001, // 0x0001 == GlobalTableSpec
+		PartitionKeyBindingIndexes: []uint16{2, 1},
+	}
+	return pm
 }
 
 // encodePreparedMetadata <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
 func encodePreparedMetadata(output []byte, metadata *PreparedMetadata) []byte {
-	metadata.Flags = 0x0001                                           // 0x0001 == GlobalTableSpec
 	binary.BigEndian.PutUint32(output, uint32(metadata.Flags))        // flags
 	binary.BigEndian.PutUint32(output, uint32(len(metadata.Columns))) // columns_count
 
@@ -133,6 +146,31 @@ func encodePreparedMetadata(output []byte, metadata *PreparedMetadata) []byte {
 				BLOB     (3,  BytesType.instance, ProtocolVersion.V1),
 		*/
 		binary.BigEndian.PutUint16(output, c.Type)
+	}
+
+	return output
+}
+
+func prepareMetadataToResultMetadata(preparedMeta *PreparedMetadata) *ResultMetadata {
+	// This isn't correct as these flags are not correct - but we don't use them yet
+	return &ResultMetadata{
+		Flags:   preparedMeta.Flags,
+		Columns: preparedMeta.Columns,
+	}
+}
+
+func encodeResultMetadata(output []byte, metadata *ResultMetadata) []byte {
+	binary.BigEndian.PutUint32(output, uint32(metadata.Flags))        // flags
+	binary.BigEndian.PutUint32(output, uint32(len(metadata.Columns))) // columns_count
+
+	// <global_table_spec>
+	output = append(output, []byte(metadata.Columns[0].Keyspace)...)
+	output = append(output, []byte(metadata.Columns[0].Table)...)
+
+	// col_spec_1 ... col_spec_n
+	for _, c := range metadata.Columns {
+		output = append(output, []byte(c.ColumnName)...)
+		binary.BigEndian.PutUint16(output, c.Type) // Only native types supported
 	}
 
 	return output

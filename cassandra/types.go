@@ -64,13 +64,18 @@ Opcode to MessageType
 
 type PreparedMetadata struct {
 	Flags                      int32
-	Columns                    []ColumnSpecification // It's not really []string, but this is enough for now
+	Columns                    []ColumnSpecification
 	PartitionKeyBindingIndexes []uint16
+}
+
+type ResultMetadata struct {
+	Flags   int32
+	Columns []ColumnSpecification
 }
 
 type ColumnSpecification struct {
 	Keyspace   string
 	Table      string
-	ColumnName string
-	Type       uint16 // Only support basic types
+	ColumnName string // Missing keepCase parameter
+	Type       uint16 // Only support native types
 }
