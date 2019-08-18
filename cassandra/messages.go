@@ -1,13 +1,19 @@
 package cassandra
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"sync/atomic"
 )
 
 var prepareCount uint64
+
+const (
+	cqlShStartMessage = "SELECT * FROM system.local WHERE key='local'"
+)
 
 func replyMessage(opCode Opcode, streamID uint16, body []byte) *Frame {
 	header := &Header{
@@ -26,7 +32,7 @@ func replyMessage(opCode Opcode, streamID uint16, body []byte) *Frame {
 
 // VoidMessage is an empty RESULT reply with code 0x0001 and rest of the body is empty
 func VoidMessage(inputMessage *Frame) *Frame {
-	replyBody := make([]byte, 0, 4)
+	replyBody := make([]byte, 4)
 	binary.BigEndian.PutUint32(replyBody, 0x0001)
 	return replyMessage(RESULT, inputMessage.Header.Stream, replyBody)
 }
@@ -39,26 +45,41 @@ func ReadyMessage(inputMessage *Frame) *Frame {
 // PreparedMessage returns acknowledge to prepare, the body parameter consists of the CQL query to prepare as a [long string].
 // This method is currently only preparing for the cassandra-stress program as there's no real backend
 func PreparedMessage(inputMessage *Frame) *Frame {
-	replyBody := make([]byte, 0) // TODO Add length for allocation
-	binary.BigEndian.PutUint32(replyBody, 0x0004)
+	// replyBody := []byte{}
+	buf := new(bytes.Buffer)
+	// replyBody := make([]byte, 6, 26)
+	// replyBody := make([]byte, 0, 256) // TODO Add length for allocation
+	binary.Write(buf, binary.BigEndian, uint32(0x0004))
+	// binary.BigEndian.PutUint32(replyBody, 0x0004)
+	// fmt.Printf("1: Length to encode: %d\n", len(replyBody))
 
-	preparedHasher := md5.New()
-
-	statementNumber := make([]byte, 0, 8)
+	statementNumber := make([]byte, 8)
 	binary.BigEndian.PutUint64(statementNumber, atomic.AddUint64(&prepareCount, 1))
-	statementID := preparedHasher.Sum(statementNumber)
+
+	statementID := md5.Sum(statementNumber)
+	// statementID := preparedHasher.Sum(statementNumber)
 
 	// Write id, [short bytes]
-	binary.BigEndian.PutUint16(replyBody, 16)
-	replyBody = append(replyBody, statementID...)
+	binary.Write(buf, binary.BigEndian, uint16(16))
 
-	// Write metadata
+	// binary.BigEndian.PutUint16(replyBody[4:], 16)
+
+	// fmt.Printf("2: Length to encode: %d\n", len(replyBody))
+
+	if len(statementID) != 16 {
+		panic("StatementID is incorrect")
+	}
+
+	binary.Write(buf, binary.BigEndian, statementID)
+	// replyBody = append(replyBody, statementID[:]...)
+
+	// Write metadata - yes, it needs to be written
 	prepareMeta := prepare(inputMessage.Body) // this should be created first..
-	replyBody = encodePreparedMetadata(replyBody, prepareMeta)
+	encodePreparedMetadata(buf, prepareMeta)
 
 	// Write resultMetadata, which is the same as rows metadata..
 	resultMeta := prepareMetadataToResultMetadata(prepareMeta)
-	replyBody = encodeResultMetadata(replyBody, resultMeta)
+	encodeResultMetadata(buf, resultMeta)
 
 	// The result to a PREPARE message. The body of a Prepared result is:
 	// [short] A 2 bytes unsigned integer
@@ -89,7 +110,8 @@ func PreparedMessage(inputMessage *Frame) *Frame {
 		                    response = new ResultMessage.Prepared(statementId, resultMetadataId, meta, resultMeta);
 	*/
 
-	return replyMessage(RESULT, inputMessage.Header.Stream, replyBody)
+	// fmt.Printf("Length to encode: %d\n", len(replyBody))
+	return replyMessage(RESULT, inputMessage.Header.Stream, buf.Bytes())
 }
 
 func prepare(body []byte) *PreparedMetadata {
@@ -99,7 +121,7 @@ func prepare(body []byte) *PreparedMetadata {
 
 // prepareCassandraStress works for the normal insert workload in the cassandra-stress tool
 func prepareCassandraStress() *PreparedMetadata {
-	columns := make([]ColumnSpecification, 0, 6)
+	columns := make([]ColumnSpecification, 6)
 	for i := 0; i < 6; i++ {
 		columns[i] = ColumnSpecification{
 			Keyspace:   "keyspace1",
@@ -116,26 +138,42 @@ func prepareCassandraStress() *PreparedMetadata {
 	return pm
 }
 
-// encodePreparedMetadata <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
-func encodePreparedMetadata(output []byte, metadata *PreparedMetadata) []byte {
-	binary.BigEndian.PutUint32(output, uint32(metadata.Flags))        // flags
-	binary.BigEndian.PutUint32(output, uint32(len(metadata.Columns))) // columns_count
+func writeString(output io.Writer, input string) {
+	result := []byte(input)
+	binary.Write(output, binary.BigEndian, uint16(len(result)))
+	binary.Write(output, binary.BigEndian, result)
+}
 
-	binary.BigEndian.PutUint32(output, uint32(len(metadata.PartitionKeyBindingIndexes))) // pk_count
+// encodePreparedMetadata <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
+func encodePreparedMetadata(output io.Writer, metadata *PreparedMetadata) {
+	// startPos := len(output)
+	// fmt.Printf("3 Encoding continuing from: %d\n", startPos)
+	binary.Write(output, binary.BigEndian, uint32(metadata.Flags))
+	// binary.BigEndian.PutUint32(output[startPos:], uint32(metadata.Flags))          // flags
+	binary.Write(output, binary.BigEndian, uint32(len(metadata.Columns)))
+	// binary.BigEndian.PutUint32(output[startPos+4:], uint32(len(metadata.Columns))) // columns_count
+
+	binary.Write(output, binary.BigEndian, uint32(len(metadata.PartitionKeyBindingIndexes)))
+	// binary.BigEndian.PutUint32(output[startPos+8:], uint32(len(metadata.PartitionKeyBindingIndexes))) // pk_count
+
+	// fmt.Printf("4 Encoding continuing from: %d\n", startPos)
 
 	// pk_index_1 ... pk_index_n
 	for _, s := range metadata.PartitionKeyBindingIndexes {
-		binary.BigEndian.PutUint16(output, s)
+		binary.Write(output, binary.BigEndian, uint16(s))
+		// binary.BigEndian.PutUint16(output[startPos:], s)
 	}
 
 	// We assume same table and keyspace for all of these.. as this is global_table_spec only
 	// <global_table_spec>
-	output = append(output, []byte(metadata.Columns[0].Keyspace)...)
-	output = append(output, []byte(metadata.Columns[0].Table)...)
+	writeString(output, metadata.Columns[0].Keyspace)
+	writeString(output, metadata.Columns[0].Table)
 
 	// col_spec_1 ... col_spec_n
 	for _, c := range metadata.Columns {
-		output = append(output, []byte(c.ColumnName)...)
+		writeString(output, c.ColumnName)
+		// binary.Write(output, binary.BigEndian, []byte(c.ColumnName))
+		// output = append(output, []byte(c.ColumnName)...)
 		// Write type..
 
 		/*
@@ -145,10 +183,9 @@ func encodePreparedMetadata(output []byte, metadata *PreparedMetadata) []byte {
 							   will be described when this is used.
 				BLOB     (3,  BytesType.instance, ProtocolVersion.V1),
 		*/
-		binary.BigEndian.PutUint16(output, c.Type)
+		binary.Write(output, binary.BigEndian, uint16(c.Type))
+		// binary.BigEndian.PutUint16(output, c.Type)
 	}
-
-	return output
 }
 
 func prepareMetadataToResultMetadata(preparedMeta *PreparedMetadata) *ResultMetadata {
@@ -159,19 +196,76 @@ func prepareMetadataToResultMetadata(preparedMeta *PreparedMetadata) *ResultMeta
 	}
 }
 
-func encodeResultMetadata(output []byte, metadata *ResultMetadata) []byte {
-	binary.BigEndian.PutUint32(output, uint32(metadata.Flags))        // flags
-	binary.BigEndian.PutUint32(output, uint32(len(metadata.Columns))) // columns_count
+func encodeResultMetadata(output io.Writer, metadata *ResultMetadata) {
+	binary.Write(output, binary.BigEndian, uint32(metadata.Flags))        // flags
+	binary.Write(output, binary.BigEndian, uint32(len(metadata.Columns))) // columns_count
 
 	// <global_table_spec>
-	output = append(output, []byte(metadata.Columns[0].Keyspace)...)
-	output = append(output, []byte(metadata.Columns[0].Table)...)
+	writeString(output, metadata.Columns[0].Keyspace)
+	writeString(output, metadata.Columns[0].Table)
 
 	// col_spec_1 ... col_spec_n
 	for _, c := range metadata.Columns {
-		output = append(output, []byte(c.ColumnName)...)
-		binary.BigEndian.PutUint16(output, c.Type) // Only native types supported
+		writeString(output, c.ColumnName)
+		binary.Write(output, binary.BigEndian, uint16(c.Type)) // Only native types supported
+	}
+}
+
+func readLongString(start uint32, body []byte) (uint32, string) {
+	sizeOfString := binary.BigEndian.Uint32(body[start : start+4])
+	stringEnd := start + 4 + sizeOfString
+	return stringEnd, string(body[start+4 : stringEnd])
+}
+
+func QueryMessage(inputMessage *Frame) *Frame {
+	/*
+		     Performs a CQL query. The body of the message must be:
+		       <query><query_parameters>
+		     where <query> is a [long string] representing the query and
+		   	<query_parameters> must be
+			   <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>]
+
+			[long string] An [int] n, followed by n bytes representing an UTF-8 string.
+			[int] A 4 bytes integer
+	*/
+	_, queryMessage := readLongString(0, inputMessage.Body)
+	if queryMessage == cqlShStartMessage {
+		// Process and return..
+		// if SELECT * FROM system.local WHERE key='local' reply with:
+		/*
+						cqlsh wants these:
+
+			            'build': result['release_version'],
+			            'protocol': result['native_protocol_version'],
+			            'cql': result['cql_version'],
+
+		*/
+		replyBody := make([]byte, 4)
+		binary.BigEndian.PutUint32(replyBody, 0x0002) // ROWS reply
+		/*
+		     Indicates a set of rows. The rest of the body of a Rows result is:
+		       <metadata><rows_count><rows_content>
+		     where:
+		       - <metadata> is composed of:
+		   		 <flags><columns_count>[<paging_state>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
+		*/
+		binary.BigEndian.PutUint32(replyBody, 0x0004) // No_metadata
+		// encodeResultMetadata allows writing col_specs..
+		binary.BigEndian.PutUint32(replyBody, 3) // Column count of 3
+		binary.BigEndian.PutUint32(replyBody, 1) // Row count of 1
+
+		//
+		// [bytes]        A [int] n, followed by n bytes if n >= 0. If n < 0,
+		// no byte should follow and the value represented is `null`.
+		/*
+			    - <rows_content> is composed of <row_1>...<row_m> where m is <rows_count>.
+			    Each <row_i> is composed of <value_1>...<value_n> where n is
+			    <columns_count> and where <value_j> is a [bytes] representing the value
+			    returned for the jth column of the ith row. In other words, <rows_content>
+				is composed of (<rows_count> * <columns_count>) [bytes].
+		*/
+
 	}
 
-	return output
+	return VoidMessage(inputMessage)
 }
